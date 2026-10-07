@@ -1,0 +1,27 @@
+# Java / Maven
+backend/target/
+*.class
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Node / React (for later)
+frontend/node_modules/
+frontend/build/
+
+# Python
+ml/__pycache__/
+ml/*.pyc
+ml/venv/
+ml/data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment secrets (if you add any later)
+.env
+# Large CSV datasets
+backend/src/main/resources/data/*.csv

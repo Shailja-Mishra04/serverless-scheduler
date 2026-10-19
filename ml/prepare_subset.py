@@ -1,49 +1,51 @@
+import numpy as np
 import pandas as pd
 
-# Load the full dataset
-df = pd.read_feather("data/raw/invocations_per_function_md.feather")
-
-
-
-# Step 1: pick a manageable subset of functions (per our SRS TBD-2 decision)
 NUM_FUNCTIONS = 2000
-subset_functions = df[["HashOwner", "HashApp", "HashFunction"]].drop_duplicates().head(NUM_FUNCTIONS)
+SEED = 42          # fixed seed -> reproducible sample
+DAYS = 7
+CHUNK = 50_000
+KEYS = ["HashOwner", "HashApp", "HashFunction"]
 
-df_subset = df.merge(subset_functions, on=["HashOwner", "HashApp", "HashFunction"], how="inner")
-df_subset = df_subset[df_subset["day"] <= 7]
-# Step 2: reshape wide -> long (melt the 1440 minute columns into rows)
-minute_cols = [str(i) for i in range(1, 1441)]
+df = pd.read_feather("data/raw/invocations_per_function_md.feather")
+assert df.columns[4] == "1" and df.columns[1443] == "1440" and df.columns[1444] == "day"
 
-long_df = df_subset.melt(
-    id_vars=["HashOwner", "HashApp", "HashFunction", "Trigger", "day"],
-    value_vars=minute_cols,
-    var_name="minute_of_day",
-    value_name="invocation_count"
-)
+# Calls per function-day row, computed in chunks to limit memory
+totals = np.empty(len(df), dtype=np.int64)
+for s in range(0, len(df), CHUNK):
+    totals[s:s + CHUNK] = df.iloc[s:s + CHUNK, 4:1444].to_numpy().sum(axis=1, dtype=np.int64)
 
-# Step 3: build a readable function identifier, then map to a short integer ID
-long_df["function_id_full"] = long_df["HashOwner"] + "_" + long_df["HashApp"] + "_" + long_df["HashFunction"]
-long_df["minute_of_day"] = long_df["minute_of_day"].astype(int)
+# Functions with at least one call in days 1..DAYS
+mask = (totals > 0) & (df["day"].to_numpy() <= DAYS)
+active_keys = df.loc[mask, KEYS].drop_duplicates()
+print("Active functions in days 1-%d: %d" % (DAYS, len(active_keys)))
 
-# Create a lookup table: full hash -> short integer ID
-unique_functions = long_df["function_id_full"].unique()
-function_id_map = {full_id: short_id for short_id, full_id in enumerate(unique_functions, start=1)}
+sampled = active_keys.sample(NUM_FUNCTIONS, random_state=SEED)
 
-long_df["function_id"] = long_df["function_id_full"].map(function_id_map)
+# Keep only sampled functions, days 1..DAYS
+sel = pd.MultiIndex.from_frame(df[KEYS]).isin(pd.MultiIndex.from_frame(sampled[KEYS]))
+sub = df[sel & (df["day"].to_numpy() <= DAYS)].reset_index(drop=True)
 
-# Save the lookup table separately (so we don't lose the original hash mapping)
-functions_lookup = pd.DataFrame(list(function_id_map.items()), columns=["function_hash", "function_id"])
-functions_lookup.to_csv("data/processed/functions_lookup.csv", index=False)
+# Wide -> long using numpy (only non-zero minutes)
+counts = sub.iloc[:, 4:1444].to_numpy()
+rows, cols = np.nonzero(counts)
 
-# Optional but recommended: drop rows with 0 invocations to keep file size sane
-long_df = long_df[long_df["invocation_count"] > 0]
+key_str = sub["HashOwner"] + "_" + sub["HashApp"] + "_" + sub["HashFunction"]
+codes, uniques = pd.factorize(key_str)
 
-# Step 4: keep only the columns our schema actually needs
-final_df = long_df[["function_id", "day", "minute_of_day", "invocation_count"]]
+final_df = pd.DataFrame({
+    "function_id": codes[rows] + 1,
+    "day": sub["day"].to_numpy()[rows].astype(int),
+    "minute_of_day": cols + 1,
+    "invocation_count": counts[rows, cols].astype(np.int64),
+})
 
+pd.DataFrame({"function_hash": uniques,
+              "function_id": np.arange(1, len(uniques) + 1)}) \
+  .to_csv("data/processed/functions_lookup.csv", index=False)
+
+print("Distinct functions:", final_df["function_id"].nunique())
 print("Final shape:", final_df.shape)
 print(final_df.head(10))
-
-# Step 5: export clean, ready-to-ingest CSV
 final_df.to_csv("data/processed/invocations_subset.csv", index=False)
 print("Saved to data/processed/invocations_subset.csv")

@@ -1,4 +1,6 @@
 package com.scheduler.backend;
 
-public record SimulationResult(String policy, SliceStats overall,
-                               SliceStats longTail, SliceStats rest) { }
+import java.util.Map;
+
+public record SimulationResult(String policy, SliceStats overall, SliceStats longTail,
+                               SliceStats rest, Map<String, SliceStats> bands) { }

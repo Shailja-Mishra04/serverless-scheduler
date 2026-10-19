@@ -18,13 +18,25 @@ import java.util.function.Supplier;
 public class SimulationService {
 
     private static final double LONG_TAIL_FRACTION = 0.20; // bottom 20% by event count
+    private static final String[] BAND_NAMES = {"1-9", "10-49", "50-499", "500-4999", "5000+"};
 
     private final JdbcTemplate jdbc;
     private Map<String, long[]> cache;   // function_id -> sorted global minutes
 
     public SimulationService(JdbcTemplate jdbc) { this.jdbc = jdbc; }
 
-    private static class Acc { long fns, events, cold, idle; }
+    private static class Acc {
+        long fns, events, cold, idle;
+        double sumRate;
+        void add(long ev, long cd, long id) {
+            fns++; events += ev; cold += cd; idle += id;
+            sumRate += ev == 0 ? 0 : (double) cd / ev;
+        }
+    }
+
+    private static int bandOf(int n) {
+        return n < 10 ? 0 : n < 50 ? 1 : n < 500 ? 2 : n < 5000 ? 3 : 4;
+    }
 
     /** Reads the whole table once; later runs reuse it. */
     private synchronized Map<String, long[]> data() {
@@ -37,7 +49,7 @@ public class SimulationService {
         PreparedStatementCreator psc = con -> {
             PreparedStatement ps = con.prepareStatement(
                     sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
-            ps.setFetchSize(Integer.MIN_VALUE);   // stream rows instead of loading all at once
+            ps.setFetchSize(Integer.MIN_VALUE);
             return ps;
         };
 
@@ -76,13 +88,14 @@ public class SimulationService {
         long threshold = sizes[(int) (sizes.length * LONG_TAIL_FRACTION)];
 
         Acc all = new Acc(), tail = new Acc(), rest = new Acc();
+        Acc[] bands = new Acc[BAND_NAMES.length];
+        for (int i = 0; i < bands.length; i++) bands[i] = new Acc();
 
         for (long[] minutes : data.values()) {
             KeepAlivePolicy policy = policyFactory.get();
-            long warmUntil = -1, events = 0, cold = 0, idle = 0;
+            long warmUntil = -1, cold = 0, idle = 0;
 
             for (long t : minutes) {
-                events++;
                 boolean isWarm = t <= warmUntil;
                 if (!isWarm) cold++;
 
@@ -93,30 +106,32 @@ public class SimulationService {
                 warmUntil = newWarmUntil;
             }
 
-            Acc bucket = minutes.length <= threshold ? tail : rest;
-            for (Acc a : new Acc[]{all, bucket}) {
-                a.fns++; a.events += events; a.cold += cold; a.idle += idle;
-            }
+            long events = minutes.length;
+            all.add(events, cold, idle);
+            (events <= threshold ? tail : rest).add(events, cold, idle);
+            bands[bandOf(minutes.length)].add(events, cold, idle);
         }
-        return new SimulationResult(policyName, toStats(all), toStats(tail), toStats(rest));
+
+        Map<String, SliceStats> bandMap = new LinkedHashMap<>();
+        for (int i = 0; i < bands.length; i++) bandMap.put(BAND_NAMES[i], toStats(bands[i]));
+        return new SimulationResult(policyName, toStats(all), toStats(tail), toStats(rest), bandMap);
     }
 
     /** How many functions (and events) fall into each call-count band. */
     public List<BandStats> bands() {
-        String[] names = {"1-9 events", "10-49 events", "50-499 events", "500-4999 events", "5000+ events"};
         long[] fns = new long[5], evs = new long[5];
         for (long[] m : data().values()) {
-            int n = m.length;
-            int b = n < 10 ? 0 : n < 50 ? 1 : n < 500 ? 2 : n < 5000 ? 3 : 4;
-            fns[b]++; evs[b] += n;
+            int b = bandOf(m.length);
+            fns[b]++; evs[b] += m.length;
         }
         List<BandStats> out = new ArrayList<>();
-        for (int i = 0; i < 5; i++) out.add(new BandStats(names[i], fns[i], evs[i]));
+        for (int i = 0; i < 5; i++) out.add(new BandStats(BAND_NAMES[i] + " events", fns[i], evs[i]));
         return out;
     }
 
     private SliceStats toStats(Acc a) {
         double rate = a.events == 0 ? 0 : (double) a.cold / a.events;
-        return new SliceStats(a.fns, a.events, a.cold, rate, a.idle);
+        double meanFn = a.fns == 0 ? 0 : a.sumRate / a.fns;
+        return new SliceStats(a.fns, a.events, a.cold, rate, meanFn, a.idle);
     }
 }

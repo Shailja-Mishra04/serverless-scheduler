@@ -46,12 +46,12 @@ public class SimulationController {
     @GetMapping("/bands")
     public List<BandStats> bands() { return service.bands(); }
 
-    /** One compact table: fixed sweep + EWMA sweep + percentile sweep, run in parallel. */
+    /** One compact table: fixed, EWMA, percentile, floor+adaptive and histogram sweeps, run in parallel. */
     @GetMapping("/summary")
     public List<SummaryRow> summary() {
         List<Supplier<SimulationResult>> jobs = new ArrayList<>();
 
-        for (int m : new int[]{1, 5, 10, 20, 30, 60}) {
+        for (int m : new int[]{1, 5, 10, 20, 30, 40, 45, 50, 60}) {
             jobs.add(() -> service.run("fixed-" + m + "min", () -> new FixedKeepAlivePolicy(m)));
         }
         for (double a : new double[]{0.1, 0.3}) {
@@ -66,14 +66,35 @@ public class SimulationController {
                         () -> new PercentileKeepAlivePolicy(p, 30, 3, 1, mx, 10, 1.0)));
             }
         }
+        for (int fl : new int[]{5, 10, 20}) {
+            for (double p : new double[]{0.9, 0.99}) {
+                jobs.add(() -> service.run("floor" + fl + "-pct-p" + p + "-max60",
+                        () -> new FloorKeepAlivePolicy(fl,
+                                new PercentileKeepAlivePolicy(p, 30, 3, 1, 60, 10, 1.0))));
+            }
+            for (double x : new double[]{1.0, 2.0}) {
+                jobs.add(() -> service.run("floor" + fl + "-ewma-a0.1-x" + x,
+                        () -> new FloorKeepAlivePolicy(fl,
+                                new EwmaKeepAlivePolicy(0.1, x, 1, 60, 10))));
+            }
+        }
+        // hybrid histogram: {max window end, fallback keep-alive}
+        for (int[] cfg : new int[][]{{60, 10}, {60, 60}, {240, 60}}) {
+            jobs.add(() -> service.run("hist-max" + cfg[0] + "-fb" + cfg[1],
+                    () -> new HybridHistogramPolicy(240, 10, 0.05, 0.99, 0.10, 2.0, cfg[0], cfg[1])));
+        }
         return jobs.parallelStream().map(Supplier::get)
                 .map(SimulationController::summarize).toList();
     }
 
     private static SummaryRow summarize(SimulationResult r) {
-        Map<String, Double> b = new LinkedHashMap<>();
-        r.bands().forEach((k, v) -> b.put(k, v.meanFunctionColdStartRate()));
+        Map<String, Double> rate = new LinkedHashMap<>();
+        Map<String, Long> idle = new LinkedHashMap<>();
+        r.bands().forEach((k, v) -> {
+            rate.put(k, v.meanFunctionColdStartRate());
+            idle.put(k, v.idleWarmMinutes());
+        });
         return new SummaryRow(r.policy(), r.overall().coldStartRate(),
-                r.overall().meanFunctionColdStartRate(), r.overall().idleWarmMinutes(), b);
+                r.overall().meanFunctionColdStartRate(), r.overall().idleWarmMinutes(), rate, idle);
     }
 }

@@ -93,18 +93,22 @@ public class SimulationService {
 
         for (long[] minutes : data.values()) {
             KeepAlivePolicy policy = policyFactory.get();
-            long warmUntil = -1, cold = 0, idle = 0;
+            long winStart = -1, winEnd = -1, cold = 0, idle = 0;
 
             for (long t : minutes) {
-                boolean isWarm = t <= warmUntil;
+                boolean isWarm = t >= winStart && t <= winEnd;
                 if (!isWarm) cold++;
 
+                // charge the previous warm window only for the minutes it was actually loaded
+                if (winEnd >= 0 && t >= winStart) idle += Math.min(t, winEnd) - winStart;
+
                 policy.onInvocation(t);
+                int d = policy.preWarmMinutes();
                 int k = policy.keepAliveMinutes();
-                long newWarmUntil = t + k;
-                idle += isWarm ? Math.max(0, newWarmUntil - warmUntil) : k;
-                warmUntil = newWarmUntil;
+                winStart = t + d;
+                winEnd = t + d + k;
             }
+            if (winEnd >= 0) idle += winEnd - winStart;   // last window runs to its end
 
             long events = minutes.length;
             all.add(events, cold, idle);

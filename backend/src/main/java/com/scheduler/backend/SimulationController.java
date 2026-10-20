@@ -46,7 +46,11 @@ public class SimulationController {
     @GetMapping("/bands")
     public List<BandStats> bands() { return service.bands(); }
 
-    /** One compact table: fixed, EWMA, percentile, floor+adaptive and histogram sweeps, run in parallel. */
+    private static KeepAlivePolicy hist(int maxEnd) {
+        return new HybridHistogramPolicy(240, 10, 0.05, 0.99, 0.10, 2.0, maxEnd, 60);
+    }
+
+    /** One compact table of every policy, run in parallel. Scores days 6-7 only. */
     @GetMapping("/summary")
     public List<SummaryRow> summary() {
         List<Supplier<SimulationResult>> jobs = new ArrayList<>();
@@ -83,6 +87,19 @@ public class SimulationController {
             jobs.add(() -> service.run("hist-max" + cfg[0] + "-fb" + cfg[1],
                     () -> new HybridHistogramPolicy(240, 10, 0.05, 0.99, 0.10, 2.0, cfg[0], cfg[1])));
         }
+        // LSTM + confidence gate: (predictions, fallback, max error variance, min errors,
+        //                          k std devs, error window, min window end, max window end)
+        jobs.add(() -> service.runPerFunction("gate-hist240", fid ->
+                new LstmGatedPolicy(service.predictionsFor(fid), hist(240), 0.25, 10, 2.0, 20, 10, 240)));
+        jobs.add(() -> service.runPerFunction("gate-hist60", fid ->
+                new LstmGatedPolicy(service.predictionsFor(fid), hist(60), 0.25, 10, 2.0, 20, 10, 60)));
+        jobs.add(() -> service.runPerFunction("gate-ewma", fid ->
+                new LstmGatedPolicy(service.predictionsFor(fid),
+                        new EwmaKeepAlivePolicy(0.1, 2.0, 1, 60, 10), 0.25, 10, 2.0, 20, 10, 60)));
+        jobs.add(() -> service.runPerFunction("lstm-always-hist240", fid ->
+                new LstmGatedPolicy(service.predictionsFor(fid), hist(240),
+                        Double.MAX_VALUE, 0, 2.0, 20, 10, 240)));
+
         return jobs.parallelStream().map(Supplier::get)
                 .map(SimulationController::summarize).toList();
     }
